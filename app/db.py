@@ -2,7 +2,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
-from config import DB_FILE, EXPORT_XLSX
+from app.config import DB_FILE, EXPORT_XLSX
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS results (

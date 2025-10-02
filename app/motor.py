@@ -1,6 +1,6 @@
 import time
 import RPi.GPIO as GPIO
-from config import IN1, IN2, IN3, IN4, WAVE_SEQUENCE, STEP_DELAY, STEPS_PER_90_DEG
+from app.config import IN1, IN2, IN3, IN4, WAVE_SEQUENCE, STEP_DELAY, STEPS_PER_90_DEG
 
 class StepperMotor:
     def __init__(self):

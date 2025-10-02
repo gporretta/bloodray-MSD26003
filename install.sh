@@ -52,37 +52,6 @@ else
   echo "No requirements.txt found at ${APP_DIR}/requirements.txt (skipping)."
 fi
 
-echo "=== Creating systemd service ==="
-SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
-cat > "${SERVICE_FILE}" <<EOF
-[Unit]
-Description=Tool Test GUI (Tkinter) with ADC + Stepper
-After=network-online.target graphical.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${APP_USER}
-WorkingDirectory=${APP_DIR}
-ExecStart=${PYTHON} ${APP_DIR}/run.py
-Restart=on-failure
-RestartSec=3
-Environment=DISPLAY=:0
-UMask=002
-
-NoNewPrivileges=true
-
-[Install]
-WantedBy=graphical.target
-EOF
-
-echo "=== Reloading systemd and enabling service ==="
-systemctl daemon-reload
-systemctl enable "${APP_NAME}.service"
-
-echo "=== Starting service now ==="
-systemctl restart "${APP_NAME}.service"
-
 echo "=== Done ==="
 echo "-> Logs: ${LOG_DIR}/app.log"
 echo "-> State: ${STATE_DIR}"

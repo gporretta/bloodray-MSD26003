@@ -4,10 +4,12 @@ import signal
 import sys
 from app.gui import TestApp
 
+
 def main():
     root = tk.Tk()
-    #root.overrideredirect(True)
+
     root.attributes("-fullscreen", True)
+    root.overrideredirect(True)
     app = TestApp(root)
 
     def handle_sigint(sig, frame):
