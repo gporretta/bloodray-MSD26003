@@ -14,7 +14,7 @@ ROTATION_DELAY_S = 3  # seconds between rotations
 # --- Camera & Light Detection ---
 # Light threshold for chemiluminescence detection
 # Mean brightness value (0-255) above this indicates presence of luminol reaction (FAILED)
-LIGHT_THRESHOLD = 60  # > threshold => FAILED (adjust based on testing)
+LIGHT_THRESHOLD = 0.6  # > threshold => FAILED (adjust based on testing)
 
 # --- Files/Paths ---
 DB_FILE = "/var/lib/tool-test/test_results.db"
