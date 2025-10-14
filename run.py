@@ -9,23 +9,16 @@ def main():
     root = tk.Tk()
 
     root.attributes("-fullscreen", True)
-    root.overrideredirect(True)
+    root.config(cursor="none")
+    #root.overrideredirect(True)
     app = TestApp(root)
 
-    def handle_sigint(sig, frame):
-        try:
-            app.on_close()
-        finally:
-            sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    try:
-        root.mainloop()
-    except Exception as e:
+    def _graceful(*_):
         app.on_close()
-        sys.exit(1)
+    signal.signal(signal.SIGINT, _graceful)
+    signal.signal(signal.SIGTERM, _graceful)
 
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

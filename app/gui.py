@@ -2,36 +2,44 @@
 # gui.py
 
 import sys
+import os
+import sqlite3
 import time
 import threading
 import tkinter as tk
+from tkinter import messagebox
 from datetime import datetime
 from PIL import Image, ImageTk
 import cv2
-import numpy as np  # <-- for percentile
+import numpy as np
 
 from app.config import (
     WINDOW_GEOMETRY, BG_DARK, ROTATIONS, ROTATION_DELAY_S, LIGHT_THRESHOLD  # LIGHT_THRESHOLD unused now
 )
 from app.motor import StepperMotor
 from app.camera import CameraReader
-from app.db import init_db, save_test_result, export_to_excel
+from app.db import init_db, save_run  # DB split: external module
 
+# --- Robust-threshold tunables ---
+GUARD_ABS = 0.10      # absolute guard band (brightness units)
+GUARD_SIGMA = 3.0     # multiplier on baseline std dev
 
 class TestApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Bloodray Automated Tool Test System")
+        self.root.title("Automated Tool Test System")
         self.root.geometry(WINDOW_GEOMETRY)
         self.root.configure(bg=BG_DARK)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Escape>", lambda e: self.on_close())
 
         self.container = tk.Frame(self.root, bg=BG_DARK)
         self.container.pack(fill="both", expand=True)
 
         self.camera = CameraReader()
         self.max_light = 0.0
-        self.dynamic_threshold = None
+        self.dynamic_threshold = None       # baseline p95
+        self.effective_threshold = None     # baseline p95 + guard band
 
         # progress animation bookkeeping
         self._progress_after_id = None
@@ -42,11 +50,13 @@ class TestApp:
         self.preview_w = None
         self.preview_h = None
 
-        # metrics/timing
+        # metrics/timing (kept in-memory, persisted to DB at run end)
         self._lock = threading.Lock()
         self.metrics = self._new_metrics()
 
+        # Initialize DB schema
         init_db()
+
         self.show_home_screen()
 
     def _new_metrics(self):
@@ -71,6 +81,8 @@ class TestApp:
             "baseline_mean": None,
             "baseline_std": None,
             "baseline_p95": None,
+            "guard_band": None,
+            "effective_threshold": None,
             "first_exceed_time": None,   # seconds since analysis_start
             "max_brightness": 0.0,
         }
@@ -117,12 +129,14 @@ class TestApp:
         self.start_btn.pack(pady=(10, 12), ipadx=36, ipady=16)
         self.start_btn.config(state="normal")
 
-        tk.Button(
+        # EXPORT TO EXCEL button
+        export_btn = tk.Button(
             self.container, text="EXPORT TO EXCEL",
-            font=("Arial", 22, "bold"),
+            font=("Arial", 18, "bold"),
             bg="#2196F3", fg="white", activebackground="#1976D2",
-            relief="flat", command=export_to_excel
-        ).pack(pady=(6, 12), ipadx=18, ipady=10)
+            relief="flat", command=self.export_to_excel
+        )
+        export_btn.pack(pady=(8, 12), ipadx=18, ipady=10)
 
     def show_progress_screen(self):
         """Live camera preview with animated LOADING... in top-right."""
@@ -147,6 +161,27 @@ class TestApp:
         self.start_progress_animation()
         self.start_camera_preview()
 
+    def show_seal_warning_screen(self):
+        """Yellow screen advising the user to seal the box; click to return home."""
+        self.clear_screen()
+        color = "#FFCC00"  # yellow
+        result_label = tk.Label(
+            self.container,
+            text="Ensure Box is Sealed",
+            font=("Arial", 36, "bold"),
+            fg="black",
+            bg=color
+        )
+        result_label.pack(expand=True, fill="both")
+        # tiny hint + timestamp
+        ts = datetime.now().strftime("%H:%M:%S")
+        meta_label = tk.Label(
+            self.container, text=f"Baseline too bright (≥ 1.0) {ts}",
+            font=("Arial", 14, "bold"), fg="black", bg=color
+        )
+        meta_label.place(relx=0.99, rely=0.02, anchor="ne")
+        result_label.bind("<Button-1>", lambda e: self.show_home_screen())
+
     def show_result_screen(self, text, color):
         self.clear_screen()
         result_label = tk.Label(
@@ -155,8 +190,16 @@ class TestApp:
         )
         result_label.pack(expand=True, fill="both")
 
-        # small telemetry line (helps debugging)
-        meta = f"Baseline p95: {self.dynamic_threshold:.2f}  |  Max: {self.max_light:.2f}"
+        # small telemetry line (on-screen only)
+        eff_thr = self.effective_threshold if self.effective_threshold is not None else self.dynamic_threshold
+        guard = (self.effective_threshold - self.dynamic_threshold) if (self.effective_threshold is not None and self.dynamic_threshold is not None) else None
+        meta_parts = []
+        meta_parts.append(f"Baseline p95: {self.dynamic_threshold:.2f}" if self.dynamic_threshold is not None else "Baseline p95: N/A")
+        meta_parts.append(f"Guard: {guard:.2f}" if guard is not None else "Guard: N/A")
+        meta_parts.append(f"Eff Thr: {eff_thr:.2f}" if eff_thr is not None else "Eff Thr: N/A")
+        meta_parts.append(f"Max: {self.max_light:.2f}")
+        meta = "  |  ".join(meta_parts)
+
         meta_label = tk.Label(
             self.container, text=meta,
             font=("Arial", 14, "bold"), fg="white", bg=color
@@ -176,8 +219,8 @@ class TestApp:
     def start_camera_preview(self):
         try:
             self.camera.open_camera()
-        except Exception as e:
-            print(f"[ERROR] open_camera failed: {e}", file=sys.stderr)
+        except Exception:
+            pass
         self._update_camera_preview()
 
     def stop_camera_preview(self):
@@ -212,8 +255,7 @@ class TestApp:
             self.camera_canvas.image = photo
 
             self._camera_preview_id = self.root.after(33, self._update_camera_preview)  # ~30 FPS
-        except Exception as e:
-            print(f"[ERROR] Camera preview failed: {e}")
+        except Exception:
             self.stop_camera_preview()
 
     # ---------- animation ----------
@@ -239,12 +281,94 @@ class TestApp:
             self.progress_dots += 1
         self._progress_after_id = self.root.after(500, self._animate_tick)
 
+    # ---------- export ----------
+    def export_to_excel(self):
+        """
+        Export the SQLite DB to an Excel file. Prefers 'tooltest.db'.
+        If openpyxl is unavailable, falls back to CSV.
+        """
+        candidate_paths = [
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "data", "tooltest.db")),
+        ]
+
+        db_path = None
+        for p in candidate_paths:
+            if os.path.exists(p):
+                db_path = p
+                break
+
+        if db_path is None:
+            messagebox.showerror("Export Failed", "Could not find SQLite DB (looked for tooltest.db, app/data/bloodray.db, bloodray.db).")
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        xlsx_path = os.path.abspath(f"tooltest_export_{timestamp}.xlsx")
+        csv_path  = os.path.abspath(f"tooltest_export_{timestamp}.csv")
+
+        try:
+            # Try Excel first (requires openpyxl)
+            try:
+                from openpyxl import Workbook
+            except ImportError:
+                Workbook = None
+
+            with sqlite3.connect(db_path) as con:
+                cur = con.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+                tables = [r[0] for r in cur.fetchall()]
+                if not tables:
+                    messagebox.showwarning("Export", "Database has no tables to export.")
+                    return
+
+                if Workbook is not None:
+                    wb = Workbook()
+                    # Remove default sheet to avoid empty "Sheet"
+                    default_ws = wb.active
+                    wb.remove(default_ws)
+
+                    for table in tables:
+                        cur.execute(f"SELECT * FROM {table};")
+                        rows = cur.fetchall()
+                        headers = [d[0] for d in cur.description]
+
+                        # Excel sheet names max 31 chars and cannot contain certain chars
+                        safe_name = table[:31].replace(":", "_").replace("/", "_").replace("\\", "_").replace("*", "_").replace("?", "_").replace("[", "(").replace("]", ")")
+                        ws = wb.create_sheet(title=safe_name)
+                        # write header
+                        ws.append(headers)
+                        # write rows (convert non-str scalars directly; leave JSON as text)
+                        for r in rows:
+                            ws.append(list(r))
+
+                    wb.save(xlsx_path)
+                    messagebox.showinfo("Export Complete", f"Exported to Excel:\n{xlsx_path}")
+                else:
+                    # Fallback to CSV (one file per table? keep it simple: export test_runs only if exists)
+                    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test_runs';")
+                    has_test_runs = cur.fetchone() is not None
+                    if not has_test_runs:
+                        messagebox.showerror("Export Failed", "openpyxl not installed and no 'test_runs' table for CSV fallback.")
+                        return
+
+                    cur.execute("SELECT * FROM test_runs;")
+                    rows = cur.fetchall()
+                    headers = [d[0] for d in cur.description]
+
+                    import csv
+                    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(headers)
+                        writer.writerows(rows)
+                    messagebox.showinfo("Export Complete", f"openpyxl not installed.\nExported CSV instead:\n{csv_path}")
+
+        except Exception as e:
+            messagebox.showerror("Export Failed", f"Error during export:\n{e}")
+
     # ---------- test flow ----------
     def start_test_thread(self):
         self.start_btn.config(state="disabled")
         self.show_progress_screen()
-        print("[DEBUG] Starting test thread")
-        # reset metrics per run
+        # reset metrics per run (internal only; persisted at end)
         with self._lock:
             self.metrics = self._new_metrics()
             self.metrics["total_start"] = time.perf_counter()
@@ -255,9 +379,13 @@ class TestApp:
         """
         1) Determine baseline threshold = p95 of mean-brightness over a short window
            with the box closed (no rotation yet).
-        2) Then run the normal rotation workflow and track MAX light AFTER baseline.
-        3) PASS if MAX <= threshold; FAIL otherwise.
+        2) If baseline p95 >= 1.0, abort the run and show yellow warning (but still save).
+        3) Else, run normal rotation workflow and track MAX light AFTER baseline.
+        4) PASS if MAX <= effective threshold; FAIL otherwise.
         """
+        # Use a wall-clock timestamp string as the run ID (millisecond precision to avoid collisions)
+        timestamp_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
         # --- (1) Baseline sampling (no rotation) ---
         BASELINE_SECONDS = 2.0
         SAMPLE_PERIOD_S = 0.05  # 20 Hz
@@ -267,14 +395,13 @@ class TestApp:
         with self._lock:
             self.metrics["baseline_start"] = time.perf_counter()
 
-        print(f"[DEBUG] Baseline sampling for {BASELINE_SECONDS}s (~{num_samples} frames)")
         # ensure camera is open (progress screen already opened it)
         try:
             self.camera.open_camera()
-        except Exception as e:
-            print(f"[ERROR] open_camera for baseline failed: {e}", file=sys.stderr)
+        except Exception:
+            pass
 
-        for i in range(num_samples):
+        for _ in range(num_samples):
             try:
                 frame = self.camera.read_frame()
                 # update last_frame so preview stays live
@@ -284,8 +411,7 @@ class TestApp:
                 with self._lock:
                     self.metrics["frames_total"] += 1
                     self.metrics["frames_baseline"] += 1
-            except Exception as e:
-                print(f"[WARN] Baseline frame read failed at i={i}: {e}")
+            except Exception:
                 with self._lock:
                     self.metrics["read_errors"] += 1
             time.sleep(SAMPLE_PERIOD_S)
@@ -294,30 +420,71 @@ class TestApp:
             self.metrics["baseline_end"] = time.perf_counter()
 
         if not samples:
-            # Hard fail-safe: if baseline failed, set threshold high so we don't false-fail
+            # Fail-safe: if baseline failed, set threshold high so we don't false-fail
             self.dynamic_threshold = 255.0
-            print("[WARN] No baseline samples captured; using threshold=255.0")
+            self.effective_threshold = 255.0
             with self._lock:
                 self.metrics["baseline_samples"] = []
                 self.metrics["baseline_mean"] = None
                 self.metrics["baseline_std"] = None
                 self.metrics["baseline_p95"] = None
+                self.metrics["guard_band"] = None
+                self.metrics["effective_threshold"] = 255.0
         else:
             self.dynamic_threshold = float(np.percentile(samples, 95))
             b_mean = float(np.mean(samples))
             b_std = float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0
-            print(f"[DEBUG] Baseline p95 threshold: {self.dynamic_threshold:.2f}")
+            guard = max(GUARD_ABS, GUARD_SIGMA * b_std)
+            self.effective_threshold = float(self.dynamic_threshold + guard)
             with self._lock:
                 self.metrics["baseline_samples"] = samples
                 self.metrics["baseline_mean"] = b_mean
                 self.metrics["baseline_std"] = b_std
                 self.metrics["baseline_p95"] = self.dynamic_threshold
+                self.metrics["guard_band"] = float(guard)
+                self.metrics["effective_threshold"] = float(self.effective_threshold)
+
+        # --- (2) Early abort if baseline is too bright ---
+        thr_check = self.dynamic_threshold
+        if (thr_check is not None) and (thr_check >= 1.0):
+            # mark end time for total to record timing even on abort
+            with self._lock:
+                self.metrics["total_end"] = time.perf_counter()
+                # mirror max_brightness field for DB row convenience
+                self.metrics["max_brightness"] = float(getattr(self.camera, "max_light", 0.0))
+
+            eff_thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
+            guard_val = None
+            if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
+                guard_val = self.effective_threshold - self.dynamic_threshold
+
+            # Persist aborted run
+            save_run(
+                timestamp_id=timestamp_id,
+                status="ABORTED_SEAL_WARNING",
+                metrics=self.metrics,
+                dynamic_threshold=self.dynamic_threshold,
+                guard=guard_val,
+                eff_thr=eff_thr
+            )
+
+            # Stop any camera activity and avoid analysis/rotation
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+            try:
+                self.camera.close_camera()
+            except Exception:
+                pass
+            self.root.after(0, self.show_seal_warning_screen)
+            return
 
         # Reset max tracking AFTER baseline
         self.camera.max_light = 0.0
         self.max_light = 0.0
 
-        # --- (2) Start measurement loop (post-baseline) ---
+        # --- (3) Start measurement loop (post-baseline) ---
         with self._lock:
             self.metrics["analysis_start"] = time.perf_counter()
 
@@ -326,14 +493,13 @@ class TestApp:
 
         motor = StepperMotor()
         try:
-            for r in range(ROTATIONS):
-                print(f"[DEBUG] Starting rotation {r+1}/{ROTATIONS}")
+            for _ in range(ROTATIONS):
                 t0 = time.perf_counter()
                 motor.rotate_90()
                 t1 = time.perf_counter()
                 with self._lock:
                     self.metrics["rotation_time_accum"] += (t1 - t0)
-                print(f"[DEBUG] Rotation {r+1} complete. Waiting {ROTATION_DELAY_S}s before next rotation.")
+                # wait between rotations
                 for _ in range(int(ROTATION_DELAY_S * 10)):
                     if not getattr(self.camera, "_running", True):
                         break
@@ -355,20 +521,35 @@ class TestApp:
 
         # Collect post-baseline max
         self.max_light = float(getattr(self.camera, "max_light", 0.0))
+        with self._lock:
+            self.metrics["max_brightness"] = self.max_light
 
-        test_failed = self.max_light > self.dynamic_threshold
+        # Use effective threshold for decision
+        thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
+        test_failed = (thr is not None) and (self.max_light > thr)
         result_text = "FAILED" if test_failed else "PASSED"
         color = "red" if test_failed else "green"
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # total end
         with self._lock:
             self.metrics["total_end"] = time.perf_counter()
 
-        # --- (4) Print summary to terminal ---
-        self._print_summary(timestamp, result_text)
+        # Persist completed run
+        eff_thr = thr
+        guard_val = None
+        if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
+            guard_val = self.effective_threshold - self.dynamic_threshold
 
+        save_run(
+            timestamp_id=timestamp_id,
+            status=result_text,
+            metrics=self.metrics,
+            dynamic_threshold=self.dynamic_threshold,
+            guard=guard_val,
+            eff_thr=eff_thr
+        )
+
+        # Show result screen
         self.root.after(0, lambda: self.show_result_screen(result_text, color))
 
     def camera_loop(self):
@@ -394,14 +575,12 @@ class TestApp:
                     with self._lock:
                         self.metrics["frames_total"] += 1
                         self.metrics["frames_analysis"] += 1
-                        # capture time-to-first-exceed if threshold known
-                        thr = self.dynamic_threshold
+                        thr = self.effective_threshold
                         if (thr is not None) and (self.metrics["first_exceed_time"] is None) and (lv > thr):
                             if self.metrics["analysis_start"] is not None:
                                 self.metrics["first_exceed_time"] = time.perf_counter() - self.metrics["analysis_start"]
                     time.sleep(0.05)
-                except Exception as e:
-                    print(f"[ERROR] camera_loop read: {e}", file=sys.stderr)
+                except Exception:
                     with self._lock:
                         self.metrics["read_errors"] += 1
                     time.sleep(0.1)
@@ -410,60 +589,6 @@ class TestApp:
                 self.camera.close_camera()
             except Exception:
                 pass
-
-    # ---------- reporting ----------
-    def _print_summary(self, timestamp, result_text):
-        with self._lock:
-            m = dict(self.metrics)  # shallow copy
-
-        # durations (seconds)
-        def dur(s, e):
-            if s is None or e is None:
-                return None
-            return max(0.0, e - s)
-
-        total_time = dur(m["total_start"], m["total_end"])
-        baseline_time = dur(m["baseline_start"], m["baseline_end"])
-        analysis_time = dur(m["analysis_start"], m["analysis_end"])
-        rotation_time = m["rotation_time_accum"] or 0.0
-
-        # fps (avoid div-by-zero)
-        fps_analysis = (m["frames_analysis"] / analysis_time) if analysis_time and analysis_time > 0 else 0.0
-        fps_total = (m["frames_total"] / total_time) if total_time and total_time > 0 else 0.0
-
-        # margin (positive means above threshold → fail)
-        margin = None
-        if self.dynamic_threshold is not None:
-            margin = self.max_light - self.dynamic_threshold
-
-        # summarize
-        print("\n================= TEST SUMMARY =================")
-        print(f"Timestamp:              {timestamp}")
-        print(f"Result:                 {result_text}")
-        print("--- Thresholds/Brightness ---")
-        print(f"Baseline mean:          {m['baseline_mean']:.2f}" if m['baseline_mean'] is not None else "Baseline mean:          N/A")
-        print(f"Baseline std:           {m['baseline_std']:.2f}" if m['baseline_std'] is not None else "Baseline std:           N/A")
-        print(f"Baseline (p95):         {self.dynamic_threshold:.2f}" if self.dynamic_threshold is not None else "Baseline (p95):         N/A")
-        print(f"Max Brightness:         {self.max_light:.2f}")
-        if margin is not None:
-            print(f"Margin (max - thr):     {margin:.2f}")
-        if m["first_exceed_time"] is not None:
-            print(f"Time to first exceed:   {m['first_exceed_time']:.3f} s")
-        else:
-            print("Time to first exceed:   N/A")
-        print("--- Timing ---")
-        print(f"Total time:             {total_time:.3f} s" if total_time is not None else "Total time:             N/A")
-        print(f"Baseline time:          {baseline_time:.3f} s" if baseline_time is not None else "Baseline time:          N/A")
-        print(f"Analysis time:          {analysis_time:.3f} s" if analysis_time is not None else "Analysis time:          N/A")
-        print(f"Rotation time (sum):    {rotation_time:.3f} s")
-        print("--- Frames ---")
-        print(f"Frames (baseline):      {m['frames_baseline']}")
-        print(f"Frames (analysis):      {m['frames_analysis']}")
-        print(f"Frames (total):         {m['frames_total']}")
-        print(f"Read errors:            {m['read_errors']}")
-        print(f"FPS (analysis):         {fps_analysis:.2f}")
-        print(f"FPS (overall):          {fps_total:.2f}")
-        print("================================================\n")
 
     # ---------- entry ----------
     def mainloop(self):
