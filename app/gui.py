@@ -38,8 +38,8 @@ class TestApp:
 
         self.camera = CameraReader()
         self.max_light = 0.0
-        self.dynamic_threshold = None       # baseline p95
-        self.effective_threshold = None     # baseline p95 + guard band
+        self.dynamic_threshold = 0.60       # baseline p95
+        self.effective_threshold = 0.70     # baseline p95 + guard band
 
         # progress animation bookkeeping
         self._progress_after_id = None
@@ -363,6 +363,86 @@ class TestApp:
 
         except Exception as e:
             messagebox.showerror("Export Failed", f"Error during export:\n{e}")
+    
+        # ---------- summary / reporting ----------
+    @staticmethod
+    def _safe_div(n, d):
+        try:
+            return float(n) / float(d) if d not in (None, 0) else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _fmt_sec(s):
+        return "N/A" if s is None else f"{s:.3f}s"
+
+    def _print_run_summary(self, *, timestamp_id: str, status: str):
+        m = self.metrics
+
+        # Durations
+        total_dur    = (m["total_end"]    - m["total_start"])    if m["total_end"]    and m["total_start"]    else None
+        baseline_dur = (m["baseline_end"] - m["baseline_start"]) if m["baseline_end"] and m["baseline_start"] else None
+        analysis_dur = (m["analysis_end"] - m["analysis_start"]) if m["analysis_end"] and m["analysis_start"] else None
+
+        # FPS
+        baseline_fps = self._safe_div(m["frames_baseline"], baseline_dur or 0.0)
+        analysis_fps = self._safe_div(m["frames_analysis"], analysis_dur or 0.0)
+        total_fps    = self._safe_div(m["frames_total"],    total_dur or 0.0)
+
+        # Thresholds
+        baseline_p95 = self.dynamic_threshold
+        eff_thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
+        guard_val = None
+        if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
+            guard_val = self.effective_threshold - self.dynamic_threshold
+
+        # Build the report text
+        lines = []
+        lines.append("=" * 72)
+        lines.append("Bloodray Run Summary")
+        lines.append("=" * 72)
+        lines.append(f"Run ID:               {timestamp_id}")
+        lines.append(f"Result:               {status}")
+        lines.append(f"Time (total):         {self._fmt_sec(total_dur)}")
+        lines.append(f"  - Baseline:         {self._fmt_sec(baseline_dur)}")
+        lines.append(f"  - Analysis:         {self._fmt_sec(analysis_dur)}")
+        lines.append(f"Frames (total):       {m['frames_total']}")
+        lines.append(f"  - Baseline frames:  {m['frames_baseline']}")
+        lines.append(f"  - Analysis frames:  {m['frames_analysis']}")
+        lines.append(f"Read errors:          {m['read_errors']}")
+        lines.append(f"FPS (total):          {total_fps:.2f}")
+        lines.append(f"  - Baseline FPS:     {baseline_fps:.2f}")
+        lines.append(f"  - Analysis FPS:     {analysis_fps:.2f}")
+        lines.append("-" * 72)
+        lines.append(f"Baseline p95:         {baseline_p95 if baseline_p95 is not None else 'N/A'}")
+        lines.append(f"Baseline mean:        {m['baseline_mean'] if m['baseline_mean'] is not None else 'N/A'}")
+        lines.append(f"Baseline std:         {m['baseline_std'] if m['baseline_std'] is not None else 'N/A'}")
+        lines.append(f"Guard band:           {guard_val if guard_val is not None else 'N/A'}  "
+                     f"(abs={GUARD_ABS}, sigma_mult={GUARD_SIGMA})")
+        lines.append(f"Effective threshold:  {eff_thr if eff_thr is not None else 'N/A'}")
+        lines.append(f"Max brightness:       {self.max_light:.6f}")
+        lines.append(f"First exceed @:       {self._fmt_sec(m['first_exceed_time'])}")
+        lines.append("-" * 72)
+        lines.append(f"Rotations:            {ROTATIONS}")
+        lines.append(f"Rotation delay:       {ROTATION_DELAY_S}s")
+        lines.append(f"Rotation time (sum):  {self._fmt_sec(m['rotation_time_accum'])}")
+        lines.append("=" * 72)
+        lines.append("")  # newline
+
+        report_text = "\n".join(lines)
+
+        # Print to console
+        print(report_text)
+
+        # Save to timestamped text file
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_path = os.path.abspath(f"run_summary_{timestamp}.txt")
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(report_text)
+            print(f"[INFO] Run summary saved to {log_path}\n")
+        except Exception as e:
+            print(f"[WARN] Failed to write summary to file: {e}")
 
     # ---------- test flow ----------
     def start_test_thread(self):
@@ -452,13 +532,13 @@ class TestApp:
                 self.metrics["total_end"] = time.perf_counter()
                 # mirror max_brightness field for DB row convenience
                 self.metrics["max_brightness"] = float(getattr(self.camera, "max_light", 0.0))
-
+        
             eff_thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
             guard_val = None
             if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
                 guard_val = self.effective_threshold - self.dynamic_threshold
 
-            # Persist aborted run
+        #    # Persist aborted run
             save_run(
                 timestamp_id=timestamp_id,
                 status="ABORTED_SEAL_WARNING",
@@ -548,6 +628,11 @@ class TestApp:
             guard=guard_val,
             eff_thr=eff_thr
         )
+
+        try:
+            self._print_run_summary(timestamp_id=timestamp_id, status=result_text)
+        except Exception as e:
+            print(f"[WARN] Failed to print run summary: {e}")
 
         # Show result screen
         self.root.after(0, lambda: self.show_result_screen(result_text, color))
