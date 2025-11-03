@@ -144,13 +144,9 @@ class TestApp:
         Start a lightweight background reader that continuously grabs frames and
         updates self.camera.last_frame so the on-screen preview stays live during
         misting/rotation (when analysis loop isn't running yet).
-
-        Uses a captured stop Event in the thread to avoid races with attribute clearing.
         """
-        # If already running, do nothing
         if self._mist_preview_thread and self._mist_preview_thread.is_alive():
             return
-
         # ensure camera is open
         try:
             self.camera.open_camera()
@@ -158,14 +154,10 @@ class TestApp:
             pass
 
         period = 1.0 / max(1.0, fps)
+        self._mist_preview_stop = threading.Event()
 
-        # Create the stop event and keep a strong reference to it
-        stop_evt = threading.Event()
-        self._mist_preview_stop = stop_evt
-
-        def _grab_loop(evt: threading.Event):
-            # Use the captured event; do NOT read self._mist_preview_stop in here
-            while not evt.is_set():
+        def _grab_loop():
+            while not self._mist_preview_stop.is_set():
                 try:
                     frame = self.camera.read_frame()
                     self.camera.last_frame = frame
@@ -174,31 +166,21 @@ class TestApp:
                     continue
                 time.sleep(period)
 
-        th = threading.Thread(target=_grab_loop, args=(stop_evt,), daemon=True)
-        self._mist_preview_thread = th
-        th.start()
+        self._mist_preview_thread = threading.Thread(target=_grab_loop, daemon=True)
+        self._mist_preview_thread.start()
 
     def _stop_mist_preview_reader(self, timeout: float = 1.0):
-        # Take local copies to avoid races
         evt = self._mist_preview_stop
         th = self._mist_preview_thread
-
-        # Signal stop BEFORE clearing attributes
+        self._mist_preview_stop = None
+        self._mist_preview_thread = None
         if evt is not None:
-            try:
-                evt.set()
-            except Exception:
-                pass
-
+            evt.set()
         if th is not None:
             try:
                 th.join(timeout=timeout)
             except Exception:
                 pass
-
-        # Now it's safe to clear references
-        self._mist_preview_stop = None
-        self._mist_preview_thread = None
 
     def _new_metrics(self):
         return {
