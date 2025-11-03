@@ -56,10 +56,6 @@ class TestApp:
         self.last_heatmap_path = None      # str path to saved heatmap PNG
         self.last_pct_above_thr = None     # float percentage of pixels over effective threshold
 
-        # live preview reader during mist/rotate
-        self._mist_preview_stop = None
-        self._mist_preview_thread = None
-
         # metrics/timing (kept in-memory, persisted to DB at run end)
         self._lock = threading.Lock()
         self.metrics = self._new_metrics()
@@ -139,49 +135,6 @@ class TestApp:
         finally:
             self._mist_off()
 
-    def _start_mist_preview_reader(self, fps: float = 25.0):
-        """
-        Start a lightweight background reader that continuously grabs frames and
-        updates self.camera.last_frame so the on-screen preview stays live during
-        misting/rotation (when analysis loop isn't running yet).
-        """
-        if self._mist_preview_thread and self._mist_preview_thread.is_alive():
-            return
-        # ensure camera is open
-        try:
-            self.camera.open_camera()
-        except Exception:
-            pass
-
-        period = 1.0 / max(1.0, fps)
-        self._mist_preview_stop = threading.Event()
-
-        def _grab_loop():
-            while not self._mist_preview_stop.is_set():
-                try:
-                    frame = self.camera.read_frame()
-                    self.camera.last_frame = frame
-                except Exception:
-                    time.sleep(0.05)
-                    continue
-                time.sleep(period)
-
-        self._mist_preview_thread = threading.Thread(target=_grab_loop, daemon=True)
-        self._mist_preview_thread.start()
-
-    def _stop_mist_preview_reader(self, timeout: float = 1.0):
-        evt = self._mist_preview_stop
-        th = self._mist_preview_thread
-        self._mist_preview_stop = None
-        self._mist_preview_thread = None
-        if evt is not None:
-            evt.set()
-        if th is not None:
-            try:
-                th.join(timeout=timeout)
-            except Exception:
-                pass
-
     def _new_metrics(self):
         return {
             # timers (perf_counter seconds)
@@ -222,7 +175,6 @@ class TestApp:
 
         self.stop_progress_animation()
         self.stop_camera_preview()
-        self._stop_mist_preview_reader()
         try:
             self.camera.stop()
             self.camera.close_camera()
@@ -330,6 +282,8 @@ class TestApp:
         meta_parts.append(f"Baseline p95: {self.dynamic_threshold:.2f}" if self.dynamic_threshold is not None else "Baseline p95: N/A")
         meta_parts.append(f"Eff Thr: {eff_thr:.2f}" if eff_thr is not None else "Eff Thr: N/A")
         meta_parts.append(f"Max: {self.max_light:.2f}")
+        #if self.last_pct_above_thr is not None:
+        #    meta_parts.append(f"Frame Contam %: {self.last_pct_above_thr:.1f}%")
         meta = "  |  ".join(meta_parts)
 
         meta_label = tk.Label(
@@ -369,6 +323,7 @@ class TestApp:
 
         if self.last_pct_above_thr is not None and self.effective_threshold is not None:
             sub = (f"")
+            #sub = (f"Frame Contam %: {self.last_pct_above_thr:.1f}%")
         else:
             sub = "Heatmap unavailable"
         sub_lbl = tk.Label(header, text=sub, font=("Arial", 14, "bold"), fg="#CCCCCC", bg=bg)
@@ -574,8 +529,7 @@ class TestApp:
         1) Determine baseline threshold = p95 of mean-brightness over a short window
            with the box closed (no rotation yet).
         2) If baseline p95 >= 1.0, abort the run and show yellow warning (but still save).
-        3) **Misting phase**: set GPIO17 HIGH for 3 seconds **and rotate 360° during those 3 seconds**,
-           while keeping the live camera feed running on-screen.
+        3) **Misting phase**: set GPIO17 HIGH for 3 seconds **and rotate 360° during those 3 seconds**.
         4) Analysis phase: start camera loop and collect data for a fixed window (no rotation).
         5) Compute contamination % of frame above effective threshold; generate heatmap.
         6) Persist run and show result screen.
@@ -667,14 +621,10 @@ class TestApp:
         #     return
 
         # --- (3) Misting phase with 360° rotation during the 3-second pulse ---
-        # Keep live preview running by spinning a temporary background reader.
         try:
             motor = StepperMotor()
         except Exception:
             motor = None
-
-        # start lightweight preview reader so the on-screen feed does not freeze
-        self._start_mist_preview_reader(fps=25.0)
         try:
             if motor is not None:
                 self._mist_and_rotate(motor, seconds=3.0, revolutions=1.0)  # 360° over 3s
@@ -684,8 +634,6 @@ class TestApp:
                 time.sleep(3.0)
                 self._mist_off()
         finally:
-            # stop the temporary preview reader after mist/rotate completes
-            self._stop_mist_preview_reader()
             try:
                 if motor is not None:
                     motor.cleanup()

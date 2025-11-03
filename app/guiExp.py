@@ -12,7 +12,6 @@ from datetime import datetime
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
-import RPi.GPIO as GPIO
 
 from app.config import (
     WINDOW_GEOMETRY, BG_DARK, ROTATIONS, ROTATION_DELAY_S, LIGHT_THRESHOLD  # LIGHT_THRESHOLD unused now
@@ -21,9 +20,10 @@ from app.motor import StepperMotor
 from app.camera import CameraReader
 from app.db import init_db, save_run  # DB split: external module
 
-# --- Robust-threshold tunables ---
-GUARD_ABS = 0.10      # absolute guard band (brightness units)
-GUARD_SIGMA = 3.0     # multiplier on baseline std dev
+# --- Robust-threshold tunables (mean-domain, 0–255 scale) ---
+GUARD_MEAN_ABS = 5.0     # absolute guard band (counts) added to baseline quantile of frame means
+GUARD_MEAN_SIGMA = 3.0    # multiplier on baseline std dev of frame means
+BASELINE_Q = 99.5         # quantile on per-frame mean for baseline threshold
 
 class TestApp:
     def __init__(self, root):
@@ -39,8 +39,8 @@ class TestApp:
 
         self.camera = CameraReader()
         self.max_light = 0.0
-        self.dynamic_threshold = None       # baseline p95
-        self.effective_threshold = None     # baseline p95 + guard band
+        self.dynamic_threshold = None       # baseline q99.5 of frame means
+        self.effective_threshold = None     # baseline q99.5 + guard (mean-domain)
 
         # progress animation bookkeeping
         self._progress_after_id = None
@@ -51,14 +51,18 @@ class TestApp:
         self.preview_w = None
         self.preview_h = None
 
+        # frame grabber (keeps last_frame fresh at all times, incl. mist/rotation)
+        self._grabber_thread = None
+        self._grabber_running = False
+
+        # analysis loop thread (reads from last_frame; does NOT own the camera)
+        self._analysis_thread = None
+        self._analysis_running = False
+
         # heatmap accumulation (per-run)
         self._heatmap_max = None           # np.ndarray (float32), max-projection of grayscale frames
         self.last_heatmap_path = None      # str path to saved heatmap PNG
-        self.last_pct_above_thr = None     # float percentage of pixels over effective threshold
-
-        # live preview reader during mist/rotate
-        self._mist_preview_stop = None
-        self._mist_preview_thread = None
+        self.last_pct_above_thr = None     # float percentage of pixels over effective threshold (telemetry only)
 
         # metrics/timing (kept in-memory, persisted to DB at run end)
         self._lock = threading.Lock()
@@ -74,18 +78,16 @@ class TestApp:
 
         self.show_home_screen()
 
+    # ---------- GPIO ----------
     def _init_gpio(self):
-        """
-        Initialize Raspberry Pi GPIO (BCM mode) and set MIST_PIN as output LOW.
-        Fails gracefully on non-Pi/dev environments.
-        """
+        """Initialize Raspberry Pi GPIO (BCM mode) and set MIST_PIN as output LOW. Safe off-Pi."""
         try:
             import RPi.GPIO as GPIO
             GPIO.setmode(GPIO.BCM)
             GPIO.setup(self.MIST_PIN, GPIO.OUT, initial=GPIO.LOW)
             self.GPIO = GPIO
         except Exception:
-            self.GPIO = None  # running off Pi or GPIO not available; silently ignore
+            self.GPIO = None  # dev machine or unavailable; ignore
 
     def _gpio_cleanup(self):
         try:
@@ -108,30 +110,126 @@ class TestApp:
         except Exception:
             pass
 
+    # ---------- camera grabber (always-on during a run) ----------
+    def _start_frame_grabber(self):
+        """Continuously reads frames into self.camera.last_frame so the preview never stops."""
+        if self._grabber_running:
+            return
+        try:
+            self.camera.open_camera()
+        except Exception:
+            pass
+
+        self._grabber_running = True
+
+        def _loop():
+            while self._grabber_running:
+                try:
+                    frame = self.camera.read_frame()
+                    # make available to UI and analysis
+                    self.camera.last_frame = frame
+                except Exception:
+                    time.sleep(0.02)
+                    continue
+                # target ~30 fps if possible
+                time.sleep(0.01)
+
+        self._grabber_thread = threading.Thread(target=_loop, daemon=True)
+        self._grabber_thread.start()
+
+    def _stop_frame_grabber(self):
+        self._grabber_running = False
+        t = self._grabber_thread
+        self._grabber_thread = None
+        if t is not None:
+            t.join(timeout=1.0)
+
+        try:
+            self.camera.close_camera()
+        except Exception:
+            pass
+
+    # ---------- analysis loop (reads from last_frame; does not touch camera I/O) ----------
+    def _start_analysis_loop(self, duration_s: float):
+        if self._analysis_running:
+            return
+        self._analysis_running = True
+        with self._lock:
+            self.metrics["analysis_start"] = time.perf_counter()
+
+        def _loop():
+            deadline = time.perf_counter() + duration_s
+            try:
+                while self._analysis_running and time.perf_counter() < deadline:
+                    frame = getattr(self.camera, "last_frame", None)
+                    if frame is None:
+                        time.sleep(0.01)
+                        continue
+
+                    # grayscale for metrics/heatmap
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+                    # update heatmap max projection (telemetry)
+                    if self._heatmap_max is None:
+                        self._heatmap_max = gray.copy()
+                    else:
+                        np.maximum(self._heatmap_max, gray, out=self._heatmap_max)
+
+                    # per-frame mean for decision logic
+                    lv = float(np.mean(gray))
+
+                    # update max brightness (mean)
+                    if lv > getattr(self.camera, "max_light", 0.0):
+                        self.camera.max_light = lv
+
+                    with self._lock:
+                        self.metrics["frames_total"] += 1
+                        self.metrics["frames_analysis"] += 1
+                        thr = self.effective_threshold
+                        if (thr is not None) and (self.metrics["first_exceed_time"] is None) and (lv > thr):
+                            if self.metrics["analysis_start"] is not None:
+                                self.metrics["first_exceed_time"] = time.perf_counter() - self.metrics["analysis_start"]
+
+                    time.sleep(0.05)
+            finally:
+                with self._lock:
+                    self.metrics["analysis_end"] = time.perf_counter()
+                self._analysis_running = False
+
+        self._analysis_thread = threading.Thread(target=_loop, daemon=True)
+        self._analysis_thread.start()
+
+    def _stop_analysis_loop(self):
+        self._analysis_running = False
+        t = self._analysis_thread
+        self._analysis_thread = None
+        if t is not None:
+            t.join(timeout=1.0)
+
+    # ---------- helper for mist+rotation (does NOT touch camera) ----------
     def _mist_and_rotate(self, motor, seconds: float, revolutions: float = 1.0):
         """
         Drive GPIO17 HIGH while rotating the stepper ~360° over `seconds`, then set LOW.
         Rotation is approximated with four 90° moves spaced evenly across the window.
+        Camera preview continues because the frame grabber is independent.
         """
-        # how many 90° segments needed to complete `revolutions`
-        segments = max(1, int(round(4 * revolutions)))
+        segments = max(1, int(round(4 * revolutions)))      # 4 segments per revolution
         interval = float(seconds) / segments if segments > 0 else float(seconds)
 
         start = time.perf_counter()
         self._mist_on()
         try:
-            for i in range(segments):
+            for _ in range(segments):
                 t0 = time.perf_counter()
                 try:
                     motor.rotate_90()
                 except Exception:
-                    # if motor fails, still honor timing and continue mist pulse
                     pass
                 elapsed = time.perf_counter() - t0
                 remaining = interval - elapsed
                 if remaining > 0:
                     time.sleep(remaining)
-            # If loop finishes early/late, pad or do nothing to keep total close to `seconds`
+            # pad to full duration if needed
             total_elapsed = time.perf_counter() - start
             tail = seconds - total_elapsed
             if tail > 0:
@@ -139,49 +237,7 @@ class TestApp:
         finally:
             self._mist_off()
 
-    def _start_mist_preview_reader(self, fps: float = 25.0):
-        """
-        Start a lightweight background reader that continuously grabs frames and
-        updates self.camera.last_frame so the on-screen preview stays live during
-        misting/rotation (when analysis loop isn't running yet).
-        """
-        if self._mist_preview_thread and self._mist_preview_thread.is_alive():
-            return
-        # ensure camera is open
-        try:
-            self.camera.open_camera()
-        except Exception:
-            pass
-
-        period = 1.0 / max(1.0, fps)
-        self._mist_preview_stop = threading.Event()
-
-        def _grab_loop():
-            while not self._mist_preview_stop.is_set():
-                try:
-                    frame = self.camera.read_frame()
-                    self.camera.last_frame = frame
-                except Exception:
-                    time.sleep(0.05)
-                    continue
-                time.sleep(period)
-
-        self._mist_preview_thread = threading.Thread(target=_grab_loop, daemon=True)
-        self._mist_preview_thread.start()
-
-    def _stop_mist_preview_reader(self, timeout: float = 1.0):
-        evt = self._mist_preview_stop
-        th = self._mist_preview_thread
-        self._mist_preview_stop = None
-        self._mist_preview_thread = None
-        if evt is not None:
-            evt.set()
-        if th is not None:
-            try:
-                th.join(timeout=timeout)
-            except Exception:
-                pass
-
+    # ---------- metrics scaffold ----------
     def _new_metrics(self):
         return {
             # timers (perf_counter seconds)
@@ -199,17 +255,17 @@ class TestApp:
             "frames_analysis": 0,
             "read_errors": 0,
 
-            # brightness & detection
-            "baseline_samples": [],
+            # brightness & detection (mean-domain)
+            "baseline_means": [],
             "baseline_mean": None,
             "baseline_std": None,
-            "baseline_p95": None,
-            "guard_band": None,
-            "effective_threshold": None,
+            "baseline_q995": None,
+            "guard_band_mean": None,
+            "effective_threshold_mean": None,
             "first_exceed_time": None,   # seconds since analysis_start
-            "max_brightness": 0.0,
+            "max_brightness": 0.0,       # max frame mean observed during analysis
 
-            # heatmap & contamination
+            # heatmap & contamination (telemetry)
             "heatmap_png_path": None,
             "pct_frame_above_threshold": None,
         }
@@ -222,12 +278,20 @@ class TestApp:
 
         self.stop_progress_animation()
         self.stop_camera_preview()
-        self._stop_mist_preview_reader()
+
+        # stop test-time loops if any
+        self._stop_analysis_loop()
+        self._stop_frame_grabber()
+
         try:
             self.camera.stop()
+        except Exception:
+            pass
+        try:
             self.camera.close_camera()
         except Exception:
             pass
+
         self._gpio_cleanup()
         self.root.after(50, self.root.destroy)
 
@@ -302,7 +366,6 @@ class TestApp:
             bg=color
         )
         result_label.pack(expand=True, fill="both")
-        # tiny hint + timestamp
         ts = datetime.now().strftime("%H:%M:%S")
         meta_label = tk.Label(
             self.container, text=f"Baseline too bright (≥ 1.0) {ts}",
@@ -324,12 +387,13 @@ class TestApp:
         result_label.pack(expand=True, fill="both")
 
         # small telemetry line (on-screen only)
-        eff_thr = self.effective_threshold if self.effective_threshold is not None else self.dynamic_threshold
-        guard = (self.effective_threshold - self.dynamic_threshold) if (self.effective_threshold is not None and self.dynamic_threshold is not None) else None
         meta_parts = []
-        meta_parts.append(f"Baseline p95: {self.dynamic_threshold:.2f}" if self.dynamic_threshold is not None else "Baseline p95: N/A")
-        meta_parts.append(f"Eff Thr: {eff_thr:.2f}" if eff_thr is not None else "Eff Thr: N/A")
-        meta_parts.append(f"Max: {self.max_light:.2f}")
+        if self.dynamic_threshold is not None:
+            meta_parts.append(f"Baseline q{BASELINE_Q:.1f}(mean): {self.dynamic_threshold:.2f}")
+        meta_parts.append(f"Eff Thr(mean): {self.effective_threshold:.2f}" if self.effective_threshold is not None else "Eff Thr(mean): N/A")
+        meta_parts.append(f"Max(mean): {self.max_light:.2f}")
+        if self.last_pct_above_thr is not None:
+            meta_parts.append(f"Contam %: {self.last_pct_above_thr:.1f}%")
         meta = "  |  ".join(meta_parts)
 
         meta_label = tk.Label(
@@ -358,7 +422,6 @@ class TestApp:
         bg = "#111111"
         self.container.configure(bg=bg)
 
-        # Title / metrics line
         header = tk.Frame(self.container, bg=bg)
         header.pack(fill="x", pady=(8, 4))
         title_lbl = tk.Label(
@@ -368,17 +431,15 @@ class TestApp:
         title_lbl.pack(side="left", padx=(12, 8))
 
         if self.last_pct_above_thr is not None and self.effective_threshold is not None:
-            sub = (f"")
+            sub = f"Frame Contam %: {self.last_pct_above_thr:.1f}%  (thr mean: {self.effective_threshold:.2f})"
         else:
             sub = "Heatmap unavailable"
         sub_lbl = tk.Label(header, text=sub, font=("Arial", 14, "bold"), fg="#CCCCCC", bg=bg)
         sub_lbl.pack(side="left")
 
-        # Canvas for image
         canvas = tk.Canvas(self.container, bg="black", highlightthickness=0, width=780, height=440, cursor="hand2")
         canvas.pack(pady=(4, 12))
 
-        # Load & fit image
         if self.last_heatmap_path and os.path.exists(self.last_heatmap_path):
             try:
                 img_bgr = cv2.imread(self.last_heatmap_path, cv2.IMREAD_COLOR)
@@ -386,30 +447,23 @@ class TestApp:
                 disp_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
                 pil = Image.fromarray(disp_rgb)
                 photo = ImageTk.PhotoImage(pil)
-                # Place the image; bind click on the canvas so the image NEVER blocks returning home
                 canvas.create_image(0, 0, anchor=tk.NW, image=photo)
                 canvas.image = photo
             except Exception:
                 pass
 
-        # Bind click-to-home on both the canvas and the whole container,
-        # so the image area does not block returning home.
         canvas.bind("<Button-1>", lambda e: self.show_home_screen())
         self.container.bind("<Button-1>", lambda e: self.show_home_screen())
 
-        # Hint footer
         hint = tk.Label(
             self.container, text="Tap anywhere to return to Home",
             font=("Arial", 16, "bold"), fg="#DDDDDD", bg=bg
         )
         hint.pack(pady=(6, 10))
 
-    # ---------- camera preview ----------
+    # ---------- camera preview (UI) ----------
     def start_camera_preview(self):
-        try:
-            self.camera.open_camera()
-        except Exception:
-            pass
+        # The preview uses self.camera.last_frame which is kept fresh by the grabber.
         self._update_camera_preview()
 
     def stop_camera_preview(self):
@@ -428,12 +482,8 @@ class TestApp:
 
             frame = getattr(self.camera, "last_frame", None)
             if frame is None:
-                # direct read if background loop hasn't produced a frame yet
-                try:
-                    frame = self.camera.read_frame()
-                except Exception:
-                    self._camera_preview_id = self.root.after(33, self._update_camera_preview)
-                    return
+                self._camera_preview_id = self.root.after(33, self._update_camera_preview)
+                return
 
             disp = cv2.resize(frame, (self.preview_w, self.preview_h), interpolation=cv2.INTER_AREA)
             frame_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
@@ -445,7 +495,7 @@ class TestApp:
 
             self._camera_preview_id = self.root.after(33, self._update_camera_preview)  # ~30 FPS
         except Exception:
-            self.stop_camera_preview()
+            self._camera_preview_id = self.root.after(50, self._update_camera_preview)
 
     # ---------- animation ----------
     def start_progress_animation(self):
@@ -511,7 +561,6 @@ class TestApp:
 
                 if Workbook is not None:
                     wb = Workbook()
-                    # Remove default sheet to avoid empty "Sheet"
                     default_ws = wb.active
                     wb.remove(default_ws)
 
@@ -520,19 +569,15 @@ class TestApp:
                         rows = cur.fetchall()
                         headers = [d[0] for d in cur.description]
 
-                        # Excel sheet names max 31 chars and cannot contain certain chars
                         safe_name = table[:31].replace(":", "_").replace("/", "_").replace("\\", "_").replace("*", "_").replace("?", "_").replace("[", "(").replace("]", ")")
                         ws = wb.create_sheet(title=safe_name)
-                        # write header
                         ws.append(headers)
-                        # write rows (convert non-str scalars directly; leave JSON as text)
                         for r in rows:
                             ws.append(list(r))
 
                     wb.save(xlsx_path)
                     messagebox.showinfo("Export Complete", f"Exported to Excel:\n{xlsx_path}")
                 else:
-                    # Fallback to CSV (one file per table? keep it simple: export test_runs only if exists)
                     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test_runs';")
                     has_test_runs = cur.fetchone() is not None
                     if not has_test_runs:
@@ -557,54 +602,52 @@ class TestApp:
     def start_test_thread(self):
         self.start_btn.config(state="disabled")
         self.show_progress_screen()
-        # reset metrics per run (internal only; persisted at end)
+
         with self._lock:
             self.metrics = self._new_metrics()
             self.metrics["total_start"] = time.perf_counter()
-        # reset heatmap accumulators
+
+        # reset per-run telemetry
         self._heatmap_max = None
         self.last_heatmap_path = None
         self.last_pct_above_thr = None
+
+        # ensure preview keeps flowing for entire run
+        self._start_frame_grabber()
 
         t = threading.Thread(target=self.run_test, daemon=True)
         t.start()
 
     def run_test(self):
         """
-        1) Determine baseline threshold = p95 of mean-brightness over a short window
-           with the box closed (no rotation yet).
-        2) If baseline p95 >= 1.0, abort the run and show yellow warning (but still save).
-        3) **Misting phase**: set GPIO17 HIGH for 3 seconds **and rotate 360° during those 3 seconds**,
-           while keeping the live camera feed running on-screen.
-        4) Analysis phase: start camera loop and collect data for a fixed window (no rotation).
-        5) Compute contamination % of frame above effective threshold; generate heatmap.
-        6) Persist run and show result screen.
+        1) Determine baseline threshold on frame means: q99.5 + guard (no rotation).
+        2) Misting phase: set GPIO17 HIGH for 3s and rotate ~360° during those 3s (preview continues).
+        3) Analysis phase: run collection (NO rotation), track max frame mean.
+        4) Compute telemetry heatmap + contamination %.
+        5) Persist run and show PASS/FAIL based on mean-domain threshold.
         """
-        # Use a wall-clock timestamp string as the run ID (millisecond precision to avoid collisions)
         timestamp_id = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-        # --- (1) Baseline sampling (no rotation) ---
+        # --- (1) Baseline sampling (no rotation, preview active via grabber) ---
         BASELINE_SECONDS = 2.0
         SAMPLE_PERIOD_S = 0.05  # 20 Hz
         num_samples = max(5, int(BASELINE_SECONDS / SAMPLE_PERIOD_S))
-        samples = []
+
+        baseline_means = []
 
         with self._lock:
             self.metrics["baseline_start"] = time.perf_counter()
 
-        # ensure camera is open (progress screen already opened it)
-        try:
-            self.camera.open_camera()
-        except Exception:
-            pass
-
         for _ in range(num_samples):
             try:
-                frame = self.camera.read_frame()
-                # update last_frame so preview stays live
-                self.camera.last_frame = frame
-                lv = self.camera.measure_light_in_roi(frame)  # full-frame mean
-                samples.append(lv)
+                frame = getattr(self.camera, "last_frame", None)
+                if frame is None:
+                    time.sleep(SAMPLE_PERIOD_S)
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                m = float(np.mean(gray))
+                baseline_means.append(m)
+
                 with self._lock:
                     self.metrics["frames_total"] += 1
                     self.metrics["frames_baseline"] += 1
@@ -616,122 +659,79 @@ class TestApp:
         with self._lock:
             self.metrics["baseline_end"] = time.perf_counter()
 
-        if not samples:
-            # Fail-safe: if baseline failed, set threshold high so we don't false-fail
+        if not baseline_means:
+            # Fail-safe: push threshold high to avoid false-fail
             self.dynamic_threshold = 255.0
             self.effective_threshold = 255.0
             with self._lock:
-                self.metrics["baseline_samples"] = []
+                self.metrics["baseline_means"] = []
                 self.metrics["baseline_mean"] = None
                 self.metrics["baseline_std"] = None
-                self.metrics["baseline_p95"] = None
-                self.metrics["guard_band"] = None
-                self.metrics["effective_threshold"] = 255.0
+                self.metrics["baseline_q995"] = None
+                self.metrics["guard_band_mean"] = None
+                self.metrics["effective_threshold_mean"] = 255.0
         else:
-            self.dynamic_threshold = float(np.percentile(samples, 95))
-            b_mean = float(np.mean(samples))
-            b_std = float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0
-            guard = max(GUARD_ABS, GUARD_SIGMA * b_std)
-            self.effective_threshold = float(self.dynamic_threshold + guard)
+            b_means = np.array(baseline_means, dtype=np.float32)
+            dyn_mean = float(np.percentile(b_means, BASELINE_Q))
+            std_mean = float(np.std(b_means, ddof=1)) if b_means.size > 1 else 0.0
+            guard_mean = max(GUARD_MEAN_ABS, GUARD_MEAN_SIGMA * std_mean)
+            eff_thr_mean = float(np.clip(dyn_mean + guard_mean, 0.0, 255.0))
+
+            self.dynamic_threshold = dyn_mean
+            self.effective_threshold = eff_thr_mean
+
             with self._lock:
-                self.metrics["baseline_samples"] = samples
-                self.metrics["baseline_mean"] = b_mean
-                self.metrics["baseline_std"] = b_std
-                self.metrics["baseline_p95"] = self.dynamic_threshold
-                self.metrics["guard_band"] = float(guard)
-                self.metrics["effective_threshold"] = float(self.effective_threshold)
+                self.metrics["baseline_means"] = baseline_means
+                self.metrics["baseline_mean"] = float(np.mean(b_means))
+                self.metrics["baseline_std"] = std_mean
+                self.metrics["baseline_q995"] = dyn_mean
+                self.metrics["guard_band_mean"] = float(guard_mean)
+                self.metrics["effective_threshold_mean"] = eff_thr_mean
 
-        # --- (2) Early abort if baseline is too bright ---
-        # (kept commented as in current structure)
-        # thr_check = self.dynamic_threshold
-        # if (thr_check is not None):
-        #     with self._lock:
-        #         self.metrics["total_end"] = time.perf_counter()
-        #         self.metrics["max_brightness"] = float(getattr(self.camera, "max_light", 0.0))
-        #     eff_thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
-        #     guard_val = None
-        #     if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
-        #         guard_val = self.effective_threshold - self.dynamic_threshold
-        #     save_run(
-        #         timestamp_id=timestamp_id,
-        #         status="ABORTED_SEAL_WARNING",
-        #         metrics=self.metrics,
-        #         dynamic_threshold=self.dynamic_threshold,
-        #         guard=guard_val,
-        #         eff_thr=eff_thr
-        #     )
-        #     try: self.camera.stop()
-        #     except Exception: pass
-        #     try: self.camera.close_camera()
-        #     except Exception: pass
-        #     return
-
-        # --- (3) Misting phase with 360° rotation during the 3-second pulse ---
-        # Keep live preview running by spinning a temporary background reader.
+        # --- (2) Misting phase with 360° rotation during the 3-second pulse ---
         try:
             motor = StepperMotor()
         except Exception:
             motor = None
-
-        # start lightweight preview reader so the on-screen feed does not freeze
-        self._start_mist_preview_reader(fps=25.0)
         try:
             if motor is not None:
                 self._mist_and_rotate(motor, seconds=3.0, revolutions=1.0)  # 360° over 3s
             else:
-                # if motor unavailable, still pulse mist for 3 seconds
                 self._mist_on()
                 time.sleep(3.0)
                 self._mist_off()
         finally:
-            # stop the temporary preview reader after mist/rotate completes
-            self._stop_mist_preview_reader()
             try:
                 if motor is not None:
                     motor.cleanup()
             except Exception:
                 pass
 
-        # --- (4) Analysis phase (NO rotation): run camera for a fixed window ---
-        # Preserve prior overall dwell using config knobs as a proxy for analysis time.
+        # --- (3) Analysis phase (NO rotation): run analysis loop over live frames ---
         analysis_duration_s = max(2.0, float(ROTATIONS) * float(ROTATION_DELAY_S))
-        with self._lock:
-            self.metrics["analysis_start"] = time.perf_counter()
+        # reset max tracker
+        self.camera.max_light = 0.0
+        self.max_light = 0.0
 
-        camera_thread = threading.Thread(target=self.camera_loop, daemon=True)
-        camera_thread.start()
+        self._start_analysis_loop(duration_s=analysis_duration_s)
 
-        # dwell for analysis_duration_s while camera collects frames
-        dwell_end = time.perf_counter() + analysis_duration_s
-        try:
-            while time.perf_counter() < dwell_end and getattr(self.camera, "_running", True):
-                time.sleep(0.05)
-        finally:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            camera_thread.join(timeout=1.0)
+        # Wait for analysis to finish
+        self._stop_analysis_loop()
 
-        # analysis end
-        with self._lock:
-            self.metrics["analysis_end"] = time.perf_counter()
-
-        # Collect post-baseline max
+        # Collect post-baseline max frame mean
         self.max_light = float(getattr(self.camera, "max_light", 0.0))
         with self._lock:
             self.metrics["max_brightness"] = self.max_light
 
-        # Use effective threshold for decision
-        thr = self.effective_threshold if (self.effective_threshold is not None) else self.dynamic_threshold
+        # PASS/FAIL: mean-domain threshold
+        thr = self.effective_threshold
         test_failed = (thr is not None) and (self.max_light > thr)
         result_text = "FAILED" if test_failed else "PASSED"
         color = "red" if test_failed else "green"
 
-        # --- (5) Compute contamination % and generate heatmap PNG ---
+        # --- (4) Compute telemetry heatmap + contamination % ---
         heatmap_path, pct = self._finalize_heatmap_and_metrics(timestamp_id, thr)
         self.last_heatmap_path = heatmap_path
-        # Guarantee 0.0% floor if no pixels exceed threshold or threshold is None
         self.last_pct_above_thr = 0.0 if (pct is None) else float(pct)
 
         # total end
@@ -739,72 +739,22 @@ class TestApp:
             self.metrics["total_end"] = time.perf_counter()
 
         # Persist completed run
-        eff_thr = thr
-        guard_val = None
-        if (self.effective_threshold is not None) and (self.dynamic_threshold is not None):
-            guard_val = self.effective_threshold - self.dynamic_threshold
-
         save_run(
             timestamp_id=timestamp_id,
             status=result_text,
             metrics=self.metrics,
-            dynamic_threshold=self.dynamic_threshold,
-            guard=guard_val,
-            eff_thr=eff_thr
+            dynamic_threshold=self.dynamic_threshold,  # mean-domain q99.5
+            guard=(self.effective_threshold - self.dynamic_threshold) if (self.effective_threshold is not None and self.dynamic_threshold is not None) else None,
+            eff_thr=self.effective_threshold
         )
 
         # Show result screen (tap -> heatmap)
         self.root.after(0, lambda: self.show_result_screen(result_text, color))
 
-    def camera_loop(self):
-        """
-        Post-baseline measurement loop:
-        - reads frames
-        - updates last_frame for preview
-        - tracks max_light across frames
-        - accumulates per-pixel max-projection into self._heatmap_max
-        - captures time to first threshold exceed (if any)
-        """
-        try:
-            self.camera.start()  # ensures _running=True and camera opened
-            while getattr(self.camera, "_running", False):
-                try:
-                    frame = self.camera.read_frame()
-                    self.camera.last_frame = frame
-
-                    # grayscale for metrics/heatmap
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-                    # update heatmap max projection
-                    if self._heatmap_max is None:
-                        self._heatmap_max = gray.copy()
-                    else:
-                        np.maximum(self._heatmap_max, gray, out=self._heatmap_max)
-
-                    # per-frame mean for decision logic
-                    lv = float(np.mean(gray))
-
-                    # update max brightness (mean)
-                    if lv > self.camera.max_light:
-                        self.camera.max_light = lv
-
-                    with self._lock:
-                        self.metrics["frames_total"] += 1
-                        self.metrics["frames_analysis"] += 1
-                        thr = self.effective_threshold
-                        if (thr is not None) and (self.metrics["first_exceed_time"] is None) and (lv > thr):
-                            if self.metrics["analysis_start"] is not None:
-                                self.metrics["first_exceed_time"] = time.perf_counter() - self.metrics["analysis_start"]
-                    time.sleep(0.05)
-                except Exception:
-                    with self._lock:
-                        self.metrics["read_errors"] += 1
-                    time.sleep(0.1)
-        finally:
-            try:
-                self.camera.close_camera()
-            except Exception:
-                pass
+        # NOTE: keep the grabber running while result/heatmap screens are up?
+        # We'll stop it when returning Home or on close to preserve preview on result screens.
+        # If you want to stop immediately after analysis, uncomment:
+        # self._stop_frame_grabber()
 
     # ---------- heatmap & contamination helpers ----------
     def _sanitize_id_for_filename(self, timestamp_id: str) -> str:
@@ -814,19 +764,14 @@ class TestApp:
     def _finalize_heatmap_and_metrics(self, timestamp_id: str, pixel_threshold: float):
         """
         Build a colored heatmap PNG from the per-pixel max-projection and compute
-        the % of frame with pixels over 'pixel_threshold'. Returns (path, pct).
-        Updates self.metrics["heatmap_png_path"] and ["pct_frame_above_threshold"].
-
-        Guarantees pct >= 0.0 and pct == 0.0 when:
-          - pixel_threshold is None, or
-          - no pixels exceed the threshold.
+        the % of frame with pixels over 'pixel_threshold' (telemetry).
+        Returns (path, pct). Updates metrics accordingly.
         """
         heatmap_path = None
-        pct = 0.0  # default to 0% contamination if nothing exceeds threshold / no threshold
+        pct = 0.0
 
         try:
             if self._heatmap_max is None:
-                # no frames collected; nothing to save; keep pct at 0.0
                 with self._lock:
                     self.metrics["heatmap_png_path"] = None
                     self.metrics["pct_frame_above_threshold"] = 0.0
@@ -843,7 +788,6 @@ class TestApp:
 
             # Normalize max-projection to 0..255 uint8 for colormap
             maxproj = self._heatmap_max
-            # Robust normalization: guard against constant images
             mn = float(np.min(maxproj))
             mx = float(np.max(maxproj))
             if mx > mn:
@@ -859,19 +803,18 @@ class TestApp:
 
             # Compute % of pixels over threshold using original (non-normalized) scale
             if pixel_threshold is not None:
-                over = np.count_nonzero(maxproj > float(pixel_threshold))  # strictly greater than threshold
+                over = np.count_nonzero(maxproj > float(pixel_threshold))
                 total = maxproj.size
                 pct = (100.0 * over / total) if (total > 0 and over > 0) else 0.0
             else:
                 pct = 0.0
 
-            # Update metrics
             with self._lock:
                 self.metrics["heatmap_png_path"] = heatmap_path
                 self.metrics["pct_frame_above_threshold"] = pct
         except Exception:
             heatmap_path = None
-            pct = 0.0  # conservative 0% on error
+            pct = 0.0
             with self._lock:
                 self.metrics["heatmap_png_path"] = None
                 self.metrics["pct_frame_above_threshold"] = 0.0

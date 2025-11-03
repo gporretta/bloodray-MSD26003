@@ -4,9 +4,9 @@ set -euo pipefail
 # =============================
 # Config
 # =============================
-APP_NAME="tool-test"
-SERVICE_NAME="bloodray.service"
-APP_USER="gino"
+APP_NAME="lumiTest"
+SERVICE_NAME="lumiTest.service"
+APP_USER="lumi"
 APP_HOME="/home/${APP_USER}"
 APP_DIR="/opt/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
@@ -45,8 +45,8 @@ apt-get install -y \
   python3 python3-venv python3-tk \
   python3-pil python3-pil.imagetk \
   python3-rpi.gpio python3-smbus i2c-tools \
-  libopencv-dev python3-numpy \
-  sqlite3 git rsync xauth dbus-user-session
+  libopencv-dev python3-numpy python3-opencv\
+  sqlite3 git rsync xauth dbus-user-session vim
 
 # =============================
 # Raspberry Pi config (I2C)
@@ -189,4 +189,5 @@ echo "  2) If DISPLAY or XDG_RUNTIME_DIR differ, edit Environment= lines in ${SE
 echo "     then: su - ${APP_USER} -c 'systemctl --user daemon-reload && systemctl --user restart ${SERVICE_NAME}'"
 echo
 echo "Reboot to confirm autostart: sudo reboot"
+
 
