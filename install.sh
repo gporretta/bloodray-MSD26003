@@ -127,15 +127,14 @@ SERVICE_PATH="${USER_SYSTEMD_DIR}/${SERVICE_NAME}"
 echo "=== Writing user service to ${SERVICE_PATH} ==="
 cat > "${SERVICE_PATH}" << 'UNIT'
 [Unit]
-Description=Bloodray GUI (local display, user session)
+Description=lumiTest GUI (local display, user session)
 # Start with the user's graphical session. Works for Wayland or X11.
 After=graphical-session.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/tool-test
-# Your app should make itself fullscreen (run.py), so just launch it.
-ExecStart=/opt/tool-test/venv/bin/python /opt/tool-test/run.py
+WorkingDirectory=/opt/lumiTest
+ExecStart=/opt/lumiTest/venv/bin/python /opt/lumiTest/run.py
 Restart=on-failure
 RestartSec=2
 
@@ -178,16 +177,4 @@ echo "=== Installation complete ==="
 echo "User service: ${SERVICE_PATH}"
 echo
 echo "Check status (as ${APP_USER}):"
-echo "  su - ${APP_USER} -c 'systemctl --user status ${SERVICE_NAME} --no-pager'"
-echo "Logs:"
-echo "  su - ${APP_USER} -c 'journalctl --user -u ${SERVICE_NAME} -e'"
-echo
-echo "If the GUI doesn't appear on the ribbon display:"
-echo "  1) Confirm desktop is running and see session vars:"
-echo "     su - ${APP_USER} -c 'echo \$DISPLAY \$XDG_SESSION_TYPE \$XDG_RUNTIME_DIR'"
-echo "  2) If DISPLAY or XDG_RUNTIME_DIR differ, edit Environment= lines in ${SERVICE_PATH} accordingly,"
-echo "     then: su - ${APP_USER} -c 'systemctl --user daemon-reload && systemctl --user restart ${SERVICE_NAME}'"
-echo
-echo "Reboot to confirm autostart: sudo reboot"
-
-
+echo "  systemctl --user status ${SERVICE_NAME}"
