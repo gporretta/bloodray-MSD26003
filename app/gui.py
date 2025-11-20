@@ -108,36 +108,73 @@ class TestApp:
         except Exception:
             pass
 
+    def safe_gpio_output(GPIO, pin, level, *, mode=None, default_initial_low=True):
+        """
+        Call GPIO.output but auto-fix common setup errors by setting mode+setup once.
+        Retries the write after fixing. Silent no-op if GPIO is a dummy.
+        """
+        try:
+            GPIO.output(pin, level)
+            return
+        except RuntimeError as e:
+            # Missing setmode() or setup() most likely
+            try:
+                if hasattr(GPIO, "setwarnings"):
+                    GPIO.setwarnings(False)
+                if mode is None:
+                    # default to BCM if the module exposes it; else leave unchanged
+                    mode = getattr(GPIO, "BCM", None)
+                if mode is not None and hasattr(GPIO, "setmode"):
+                    GPIO.setmode(mode)
+
+                init = getattr(GPIO, "LOW", 0) if default_initial_low else getattr(GPIO, "HIGH", 1)
+                if hasattr(GPIO, "setup") and hasattr(GPIO, "OUT"):
+                    GPIO.setup(pin, GPIO.OUT, initial=init)
+
+                # retry write
+                GPIO.output(pin, level)
+                return
+            except Exception as e2:
+                print(f"[GPIO] auto-setup failed for pin {pin}: {e2}", file=sys.stderr)
+                raise
+
     def _mist_and_rotate(self, motor, seconds: float, revolutions: float = 1.0):
         """
         Drive GPIO17 HIGH while rotating the stepper ~360° over `seconds`, then set LOW.
         Rotation is approximated with four 90° moves spaced evenly across the window.
         """
-        # how many 90° segments needed to complete `revolutions`
-        segments = max(1, int(round(4 * revolutions)))
-        interval = float(seconds) / segments if segments > 0 else float(seconds)
+        self._init_gpio()
 
-        start = time.perf_counter()
-        self._mist_on()
-        try:
-            for i in range(segments):
-                t0 = time.perf_counter()
-                try:
-                    motor.rotate_90()
-                except Exception:
-                    # if motor fails, still honor timing and continue mist pulse
-                    pass
-                elapsed = time.perf_counter() - t0
-                remaining = interval - elapsed
-                if remaining > 0:
-                    time.sleep(remaining)
-            # If loop finishes early/late, pad or do nothing to keep total close to `seconds`
-            total_elapsed = time.perf_counter() - start
-            tail = seconds - total_elapsed
-            if tail > 0:
-                time.sleep(tail)
-        finally:
-            self._mist_off()
+        # how many 90° segments needed to complete `revolutions`
+        #segments = max(1, int(round(4 * revolutions)))
+        #interval = float(seconds) / segments if segments > 0 else float(seconds)
+
+        #start = time.perf_counter()
+        GPIO.output(self.MIST_PIN, self.GPIO.HIGH)  # 3.3 V
+        #self._mist_on()
+        #try:
+        #    for i in range(segments):
+        #        t0 = time.perf_counter()
+        #        try:
+        #            motor.rotate_90()
+        #        except Exception:
+        #            # if motor fails, still honor timing and continue mist pulse
+        #            pass
+        #        elapsed = time.perf_counter() - t0
+        #        remaining = interval - elapsed
+        #        if remaining > 0:
+        #            time.sleep(remaining)
+        #    # If loop finishes early/late, pad or do nothing to keep total close to `seconds`
+        #    total_elapsed = time.perf_counter() - start
+        #    tail = seconds - total_elapsed
+        #    if tail > 0:
+        #        time.sleep(tail)
+        #finally:
+        time.sleep(seconds)
+        GPIO.output(self.MIST_PIN, self.GPIO.LOW)  # 0V
+            #self._mist_off()
+
+        self._gpio_cleanup()
 
     def _start_mist_preview_reader(self, fps: float = 25.0):
         """
@@ -695,11 +732,11 @@ class TestApp:
         self._start_mist_preview_reader(fps=25.0)
         try:
             if motor is not None:
-                self._mist_and_rotate(motor, seconds=3.0, revolutions=1.0)  # 360° over 3s
+                self._mist_and_rotate(motor, seconds=0.60, revolutions=1.0)  # 360° over 3s
             else:
                 # if motor unavailable, still pulse mist for 3 seconds
                 self._mist_on()
-                time.sleep(3.0)
+                time.sleep(0.60)
                 self._mist_off()
         finally:
             # stop the temporary preview reader after mist/rotate completes
